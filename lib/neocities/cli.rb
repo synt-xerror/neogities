@@ -285,7 +285,6 @@ def push
       end
     end
   end
-end
 
 
       # --- Lista e envia arquivos ---
