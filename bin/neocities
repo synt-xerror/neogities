@@ -1,4 +1,6 @@
 #!/usr/bin/env ruby
-require File.join(File.dirname(__FILE__), '..', 'lib', 'neocities')
+$LOAD_PATH.unshift File.expand_path('../lib', __dir__)
+require 'neocities'
+
 cli = Neocities::CLI.new ARGV
 cli.run
