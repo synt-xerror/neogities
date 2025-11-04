@@ -3,792 +3,416 @@ require 'pastel'
 require 'tty/table'
 require 'tty/prompt'
 require 'fileutils'
-require 'json' # for reading configs
-require 'whirly' # for loader spinner
-
+require 'json'
+require 'whirly'
+require 'time'
 require File.join(File.dirname(__FILE__), 'client')
 
 module Neocities
   class CLI
-    SUBCOMMANDS = %w{upload delete list info push logout pizza pull}
-    HELP_SUBCOMMANDS = ['-h', '--help', 'help']
-    PENELOPE_MOUTHS = %w{^ o ~ - v U}
-    PENELOPE_EYES = %w{o ~ O}
+    SUBCOMMANDS = %w[upload delete list info push logout pizza pull].freeze
+    HELP_SUBCOMMANDS = %w[-h --help help].freeze
+    PENELOPE_EYES = %w[o ~ O].freeze
+    PENELOPE_MOUTHS = %w[^ o ~ - v U].freeze
 
     def initialize(argv)
       @argv = argv.dup
-      @pastel = Pastel.new eachline: "\n"
       @subcmd = @argv.first
-      @subargs = @argv[1..@argv.length]
+      @subargs = @argv[1..-1]
+      @pastel = Pastel.new(eachline: "\n")
       @prompt = TTY::Prompt.new
-      @api_key = ENV['NEOCITIES_API_KEY'] || nil
-      @app_config_path = File.join self.class.app_config_path('neocities'), 'config.json' # added json extension
+      @api_key = ENV['NEOCITIES_API_KEY']
+      @app_config_path = File.join(self.class.app_config_path('neocities'), 'config.json')
     end
 
-    def display_response(resp)
-      if resp[:result] == 'success'
-        puts "#{@pastel.green.bold 'SUCCESS:'} #{resp[:message]}"
-      elsif resp[:result] == 'error' && resp[:error_type] == 'file_exists'
-        out = "#{@pastel.yellow.bold 'EXISTS:'} #{resp[:message]}"
-        out += " (#{resp[:error_type]})" if resp[:error_type]
-        puts out
-      else
-        out = "#{@pastel.red.bold 'ERROR:'} #{resp[:message]}"
-        out += " (#{resp[:error_type]})" if resp[:error_type]
-        puts out
-      end
-    end
-
+    # -------------------------
+    # MAIN ENTRY
+    # -------------------------
     def run
-      if @argv[0] == 'version'
-        puts Neocities::VERSION
-        exit
+      handle_version
+
+      if help_request?
+        display_help_for_subcommand(@subargs[0]) if SUBCOMMANDS.include?(@subargs[0])
+        display_help
       end
 
-      if HELP_SUBCOMMANDS.include?(@subcmd) && SUBCOMMANDS.include?(@subargs[0])
-        send "display_#{@subargs[0]}_help_and_exit"
-      elsif @subcmd.nil? || !SUBCOMMANDS.include?(@subcmd)
-        display_help_and_exit
-      elsif @subargs.join("").match(HELP_SUBCOMMANDS.join('|')) && @subcmd != "info"
-        send "display_#{@subcmd}_help_and_exit"
-      end
-
-      if !@api_key
-        begin
-          file = File.read @app_config_path
-          data = JSON.load file
-
-          if data
-            @api_key = data["API_KEY"].strip # Remove any trailing whitespace causing HTTP requests to fail
-            @sitename = data["SITENAME"] # Store the sitename to be able to reference it later
-            @last_pull = data["LAST_PULL"] # Store the last time a pull was performed so that we only fetch from updated files
-          end
-        rescue Errno::ENOENT
-          @api_key = nil
-        end
-      end
-
-      if @api_key.nil?
-        puts "Please login to get your API key:"
-
-        if !@sitename && !@password
-          @sitename = @prompt.ask('sitename:', default: ENV['NEOCITIES_SITENAME'])
-          @password = @prompt.mask('password:', default: ENV['NEOCITIES_PASSWORD'])
-        end
-
-        @client = Neocities::Client.new sitename: @sitename, password: @password
-
-        resp = @client.key
-        if resp[:api_key]
-          conf = {
-            "API_KEY": resp[:api_key],
-            "SITENAME": @sitename,
-          }
-
-          FileUtils.mkdir_p Pathname(@app_config_path).dirname
-          File.write @app_config_path, conf.to_json
-
-          puts "The api key for #{@pastel.bold @sitename} has been stored in #{@pastel.bold @app_config_path}."
-        else
-          display_response resp
-          exit
-        end
-      else
-        @client = Neocities::Client.new api_key: @api_key
-      end
+      load_api_key_or_login
+      @client = @api_key ? Neocities::Client.new(api_key: @api_key) : @client
 
       send @subcmd
     end
 
-    def delete
-      display_delete_help_and_exit if @subargs.empty?
-      @subargs.each do |file|
-        puts @pastel.bold("Deleting #{file} ...")
-        resp = @client.delete file
+    # -------------------------
+    # SUBCOMMANDS
+    # -------------------------
+    def push
+      display_push_help if @subargs.empty?
 
-        display_response resp
+      parse_push_options
+
+      unless @local_path
+        display_response(result: 'error', message: 'No local path provided')
+        display_push_help
+      end
+
+      root_path = Pathname.new(@local_path)
+      unless root_path.exist? && root_path.directory?
+        display_response(result: 'error', message: "Invalid directory: #{root_path}")
+        display_push_help
+      end
+
+      puts @pastel.green.bold('Dry run: nothing will actually be uploaded') if @dry_run
+
+      prune_remote if @prune
+      files_to_upload(root_path).each { |file| upload_file(file, root_path) }
+    end
+
+    def upload
+      display_upload_help if @subargs.empty?
+
+      dir = ''
+      while arg = @subargs.shift
+        case arg
+        when '-d' then dir = @subargs.shift
+        when /^-/ then puts @pastel.red.bold("Unknown option: #{arg.inspect}"); display_upload_help
+        else
+          path = Pathname.new(arg)
+          if !path.exist?
+            display_response(result: 'error', message: "#{path} does not exist locally.")
+            next
+          end
+
+          if path.directory?
+            puts "#{path} is a directory, skipping (use push command)"
+            next
+          end
+
+          remote_path = ['/', dir, path.basename.to_s].join('/').gsub(%r{/+}, '/')
+          puts @pastel.bold("Uploading #{path} to #{remote_path} ...")
+          resp = @client.upload(path, remote_path)
+          display_response(resp)
+        end
       end
     end
 
-    def logout
-      confirmed = false
-      loop do
-        case @subargs[0]
-        when '-y' then @subargs.shift; confirmed = true
-        when /^-/ then puts(@pastel.red.bold("Unknown option: #{@subargs[0].inspect}")); break
-        else break
-        end
+    def delete
+      display_delete_help if @subargs.empty?
+
+      @subargs.each do |file|
+        puts @pastel.bold("Deleting #{file} ...")
+        resp = @client.delete(file)
+        display_response(resp)
       end
-      if confirmed
-        FileUtils.rm @app_config_path
-        puts @pastel.bold("Your api key has been removed.")
+    end
+
+    def list
+      @detail = @subargs.delete('-d')
+      @subargs[0] = nil if @subargs.delete('-a')
+
+      resp = @client.list(@subargs[0])
+      return display_response(resp) if resp[:result] == 'error'
+
+      if @detail
+        table = [['Path', 'Size', 'Updated'].map { |h| @pastel.bold(h) }]
+        resp[:files].each do |file|
+          table << [
+            @pastel.send(file[:is_directory] ? :blue : :green).bold(file[:path]),
+            file[:size] || '',
+            file[:updated_at] ? Time.parse(file[:updated_at]).localtime : ''
+          ]
+        end
+        puts TTY::Table.new(table).to_s
       else
-        display_logout_help_and_exit
+        resp[:files].each { |file| puts @pastel.send(file[:is_directory] ? :blue : :green).bold(file[:path]) }
       end
     end
 
     def info
       resp = @client.info(@subargs[0] || @sitename)
+      return display_response(resp) if resp[:result] == 'error'
 
-      if resp[:result] == 'error'
-        display_response resp
-        exit
+      table = resp[:info].map do |k, v|
+        v = Time.parse(v).localtime if v && %i[created_at last_updated].include?(k)
+        [@pastel.bold(k.to_s), v]
       end
-
-      out = []
-
-      resp[:info].each do |k, v|
-        v = Time.parse(v).localtime if v && (k == :created_at || k == :last_updated)
-        out.push [@pastel.bold(k), v]
-      end
-
-      puts TTY::Table.new(out).to_s
-      exit
+      puts TTY::Table.new(table).to_s
     end
 
-    def list
-      display_list_help_and_exit if @subargs.empty?
-      if @subargs.delete('-d') == '-d'
-        @detail = true
-      end
-
-      if @subargs.delete('-a')
-        @subargs[0] = nil
-      end
-
-      resp = @client.list @subargs[0]
-
-      if resp[:result] == 'error'
-        display_response resp
-        exit
-      end
-
-      if @detail
-        out = [
-          [@pastel.bold('Path'), @pastel.bold('Size'), @pastel.bold('Updated')]
-        ]
-        resp[:files].each do |file|
-          out.push([
-            @pastel.send(file[:is_directory] ? :blue : :green).bold(file[:path]),
-            file[:size] || '',
-            Time.parse(file[:updated_at]).localtime
-          ])
-        end
-        puts TTY::Table.new(out).to_s
-        exit
-      end
-
-      resp[:files].each do |file|
-        puts @pastel.send(file[:is_directory] ? :blue : :green).bold(file[:path])
-      end
-    end
-
-def push
-  display_push_help_and_exit if @subargs.empty?
-  @use_gitignore = false
-  @excluded_files = []
-  @dry_run = false
-  @prune = false
-
-  # Lendo opções
-  loop do
-    case @subargs[0]
-    when '--gitignore' then @subargs.shift; @use_gitignore = true
-    when '-e' then @subargs.shift; @excluded_files.push(@subargs.shift)
-    when '--dry-run' then @subargs.shift; @dry_run = true
-    when '--prune' then @subargs.shift; @prune = true
-    when /^-/ then puts(@pastel.red.bold("Unknown option: #{@subargs[0].inspect}")); display_push_help_and_exit
-    else break
-    end
-  end
-
-  local_path = @subargs[0]
-  display_response(result: 'error', message: "no local path provided") && display_push_help_and_exit if local_path.nil?
-
-  root_path = Pathname(local_path)
-  unless root_path.exist?
-    display_response result: 'error', message: "path #{root_path} does not exist"
-    display_push_help_and_exit
-  end
-  unless root_path.directory?
-    display_response result: 'error', message: 'provided path is not a directory'
-    display_push_help_and_exit
-  end
-
-  puts @pastel.green.bold("Doing a dry run, not actually pushing anything") if @dry_run
-
-  # --- Prune ---
-  if @prune
-    pruned_dirs = []
-    resp = @client.list
-    resp[:files].each do |file|
-      path = Pathname(File.join(local_path, file[:path]))
-      pruned_dirs << path if !path.exist? && file[:is_directory]
-      next if path.exist? || pruned_dirs.include?(path.dirname)
-
-      print @pastel.bold("Deleting #{file[:path]} ... ")
-      resp = @client.delete_wrapper_with_dry_run file[:path], @dry_run
-      resp[:result] == 'success' ? print(@pastel.green.bold("SUCCESS") + "\n") : (print "\n"; display_response resp)
-    end
-  end
-
-  # --- Lista de arquivos ---
-  Dir.chdir(root_path) do
-    paths = Dir.glob(File.join('**', '*'), File::FNM_DOTMATCH)
-
-    # --- Ignorar arquivos ---
-    ignore_patterns = []
-
-    ignore_patterns = []
-
-    # Inicializa a lista de padrões
-    ignore_patterns = []
-
-    # Lê .neoignore, uma linha por padrão
-    if File.exist?('.neoignore')
-      File.readlines('.neoignore').each do |line|
-        line.strip!
-        next if line.empty?
-        ignore_patterns << line
-      end
-      puts "Not pushing .neoignore entries" unless ignore_patterns.empty?
-    end
-
-    # Função que verifica se um arquivo/diretório deve ser ignorado
-    def ignored?(file, ignore_patterns)
-      relative_file = Pathname(file).relative_path_from(Pathname(Dir.pwd)).to_s
-      ignore_patterns.any? do |pattern|
-        # ignora tanto arquivos quanto diretórios listados
-        relative_file == pattern || relative_file.start_with?("#{pattern}/")
-      end
-    end
-
-    Dir.glob("#{root_path}/**/*") do |file|
-      next if ignored?(file, ignore_patterns)
-      next if File.directory?(file)  # <-- pula diretórios
-
-      @client.upload(file)
-    end
-
-
-    # opcional .gitignore
-    if @use_gitignore && File.exist?('.gitignore')
-      File.readlines('.gitignore').each do |line|
-        line.strip!
-        next if line.empty?
-        ignore_patterns << (line.end_with?('/') ? "#{line}**/*" : line)
-      end
-      puts "Also applying .gitignore entries"
-    end
-
-    # filtra paths
-    paths.select! do |p|
-      path_str = p.to_s
-      !ignore_patterns.any? { |pattern| File.fnmatch?(pattern, path_str) } &&
-        !@excluded_files.include?(path_str) &&
-        !@excluded_files.include?(Pathname.new(path_str).dirname.to_s)
-    end
-
-    paths.collect! { |p| Pathname p }
-
-    # --- Upload ---
-    paths.each do |path|
-      next if path.directory?
-      print @pastel.bold("Uploading #{path} ... ")
-      resp = @client.upload path, path, @dry_run
-
-      if resp[:result] == 'error' && resp[:error_type] == 'file_exists'
-        print @pastel.yellow.bold("EXISTS") + "\n"
-      elsif resp[:result] == 'success'
-        print @pastel.green.bold("SUCCESS") + "\n"
+    def logout
+      confirmed = @subargs.delete('-y')
+      if confirmed
+        FileUtils.rm(@app_config_path)
+        puts @pastel.bold('API key removed.')
       else
-        print "\n"
-        display_response resp
-      end
-    end
-  end
-
-
-      # --- Lista e envia arquivos ---
-      Dir.chdir(root_path) do
-        # Todos os arquivos recursivamente, incluindo hidden
-        paths = Dir.glob(File.join('**', '*'), File::FNM_DOTMATCH)
-
-        # Define arquivos de ignore
-        ignore_files = [".neoignore"]
-        ignore_files << ".gitignore" if @use_gitignore
-
-        ignore_patterns = []
-
-        # Lê padrões de ignore
-        ignore_files.each do |file|
-          begin
-            lines = File.readlines(file).map(&:strip).reject(&:empty?)
-            lines.each do |line|
-              # Se for diretório, adiciona glob para todo conteúdo
-              ignore_patterns << (File.directory?(line) ? "#{line}**" : line)
-            end
-          rescue Errno::ENOENT
-            # ignora se o arquivo não existir
-          end
-        end
-
-        # Filtra arquivos ignorados
-        paths.select! do |path|
-          !ignore_patterns.any? { |pattern| File.fnmatch?(pattern, path) }
-        end
-
-        # Remove arquivos/diretórios explicitamente excluídos
-        paths.select! do |p|
-          !@excluded_files.include?(p) && !@excluded_files.include?(Pathname.new(p).dirname.to_s)
-        end
-
-        # Converte para Pathname
-        paths.collect! { |path| Pathname.new(path) }
-
-        # Itera sobre arquivos e envia
-        paths.each do |path|
-          next if path.directory?
-
-          print @pastel.bold("Uploading #{path} ... ")
-          resp = @client.upload(path, path.relative_path_from(root_path), @dry_run)
-
-          if resp[:result] == 'error' && resp[:error_type] == 'file_exists'
-            print @pastel.yellow.bold("EXISTS") + "\n"
-          elsif resp[:result] == 'success'
-            print @pastel.green.bold("SUCCESS") + "\n"
-          else
-            print "\n"
-            display_response resp
-          end
-        end
-      end
-
-
-      Dir.chdir(root_path) do
-        paths = Dir.glob(File.join('**', '*'), File::FNM_DOTMATCH)
-
-        # Define os arquivos de ignore que serão usados
-        ignore_files = [".neoignore"]
-        ignore_files << ".gitignore" if @use_gitignore
-
-        ignore_patterns = []
-
-        ignore_files.each do |file|
-          begin
-            lines = File.readlines(file).map(&:strip).reject(&:empty?)
-            lines.each do |line|
-              ignore_patterns << (File.directory?(line) ? "#{line}**" : line)
-            end
-          rescue Errno::ENOENT
-            # ignora se o arquivo não existir
-          end
-        end
-
-        # Lista todos os arquivos recursivamente
-        paths = Dir.glob(File.join(root_path, "**", "*"), File::FNM_DOTMATCH)
-
-        # Remove arquivos ignorados
-        paths.select! do |path|
-          !ignore_patterns.any? { |pattern| File.fnmatch?(pattern, path) }
-        end
-
-        # Remove arquivos explicitamente excluídos via -e
-        paths.select! { |p| !@excluded_files.include?(p) && !@excluded_files.include?(Pathname.new(p).dirname.to_s) }
-
-        # Converte tudo para Pathname
-        paths.collect! { |path| Pathname.new(path) }
-
-        # Agora começa a iterar e subir os arquivos
-        paths.each do |path|
-          next if path.directory?
-          print @pastel.bold("Uploading #{path} ... ")
-          resp = @client.upload path, path.relative_path_from(root_path), @dry_run
-
-          if resp[:result] == 'error' && resp[:error_type] == 'file_exists'
-            print @pastel.yellow.bold("EXISTS") + "\n"
-          elsif resp[:result] == 'success'
-            print @pastel.green.bold("SUCCESS") + "\n"
-          else
-            print "\n"
-            display_response resp
-          end
-        end
-        # Define os arquivos de ignore que serão usados
-        ignore_files = [".neoignore"]
-        ignore_files << ".gitignore" if @use_gitignore
-
-        ignore_patterns = []
-
-        ignore_files.each do |file|
-          begin
-            lines = File.readlines(file).map(&:strip).reject(&:empty?)
-            lines.each do |line|
-              ignore_patterns << (File.directory?(line) ? "#{line}**" : line)
-            end
-          rescue Errno::ENOENT
-            # ignora se o arquivo não existir
-          end
-        end
-
-        # Lista todos os arquivos recursivamente
-        paths = Dir.glob(File.join(root_path, "**", "*"), File::FNM_DOTMATCH)
-
-        # Remove arquivos ignorados
-        paths.select! do |path|
-          !ignore_patterns.any? { |pattern| File.fnmatch?(pattern, path) }
-        end
-
-        # Remove arquivos explicitamente excluídos via -e
-        paths.select! { |p| !@excluded_files.include?(p) }
-        paths.select! { |p| !@excluded_files.include?(Pathname.new(p).dirname.to_s) }
-
-        # Converte tudo para Pathname
-        paths.collect! { |path| Pathname.new(path) }
-
-        # Agora começa a iterar e subir os arquivos
-        paths.each do |path|
-          next if path.directory?
-          print @pastel.bold("Uploading #{path} ... ")
-          resp = @client.upload path, path.relative_path_from(root_path), @dry_run
-
-          if resp[:result] == 'error' && resp[:error_type] == 'file_exists'
-            print @pastel.yellow.bold("EXISTS") + "\n"
-          elsif resp[:result] == 'success'
-            print @pastel.green.bold("SUCCESS") + "\n"
-          else
-            print "\n"
-            display_response resp
-          end
-        end
-
-      end
-    end
-
-    def upload
-      display_upload_help_and_exit if @subargs.empty?
-      @dir = ''
-
-      loop do
-        case @subargs[0]
-        when '-d' then @subargs.shift; @dir = @subargs.shift
-        when /^-/ then puts(@pastel.red.bold("Unknown option: #{@subargs[0].inspect}")); display_upload_help_and_exit
-        else break
-        end
-      end
-
-      @subargs.each do |path|
-        path = Pathname path
-
-        if !path.exist?
-          display_response result: 'error', message: "#{path} does not exist locally."
-          next
-        end
-
-        if path.directory?
-          puts "#{path} is a directory, skipping (see the push command)"
-          next
-        end
-
-        remote_path = ['/', @dir, path.basename.to_s].join('/').gsub %r{/+}, '/'
-
-        puts @pastel.bold("Uploading #{path} to #{remote_path} ...")
-        resp = @client.upload path, remote_path
-        display_response resp
+        display_logout_help
       end
     end
 
     def pull
-      begin
-        quiet = (['--quiet', '-q'].include? @subargs[0])
+      quiet = %w[--quiet -q].include?(@subargs[0])
+      file = File.read(@app_config_path)
+      data = JSON.parse(file)
 
-        file = File.read @app_config_path
-        data = JSON.load file
+      last_pull = data['LAST_PULL'] || {}
+      Whirly.start spinner: ['😺', '😸', '😹'], status: "Pulling files for #{@pastel.bold @sitename}" if quiet
 
-        last_pull_time = data["LAST_PULL"] ? data["LAST_PULL"]["time"] : nil
-        last_pull_loc = data["LAST_PULL"] ? data["LAST_PULL"]["loc"] : nil
+      resp = @client.pull(@sitename, last_pull['time'], last_pull['loc'], quiet)
 
-        Whirly.start spinner: ["😺", "😸", "😹", "😻", "😼", "😽", "🙀", "😿", "😾"], status: "Retrieving files for #{@pastel.bold @sitename}" if quiet
-        resp = @client.pull @sitename, last_pull_time, last_pull_loc, quiet
-
-        # write last pull data to file (not necessarily the best way to do this, but better than cloning every time)
-        data["LAST_PULL"] = {
-          "time": Time.now,
-          "loc": Dir.pwd
-        }
-
-        File.write @app_config_path, data.to_json
-      rescue StandardError => ex
-        Whirly.stop if quiet
-        puts @pastel.red.bold "\nA fatal error occurred :-("
-        puts @pastel.red ex
-      ensure
-        exit
-      end
+      data['LAST_PULL'] = { 'time' => Time.now, 'loc' => Dir.pwd }
+      File.write(@app_config_path, data.to_json)
+    rescue StandardError => ex
+      Whirly.stop if quiet
+      puts @pastel.red.bold("\nFatal error occurred")
+      puts @pastel.red(ex)
+    ensure
+      exit
     end
 
     def pizza
-      display_pizza_help_and_exit
-    end
-
-    def display_pizza_help_and_exit
       excuses = [
-        "Sorry, we're fresh out of pineapple today.",
-        "All the toppings just went rogue and are currently answering to no god.",
-        "Our bicycle delivery guy is out today for ska band practice.",
-        "Doughpocalypse now. Pizza's off until further notice.",
-        "Mamma mia! We're outta the cheesa.",
-        "The sauce of our youth ran dry. Pizza is off the menu for now.",
-        "There was this pizza place in Portland called Lonesomes that taped burned CDs of local bands to the pizza box. It was pretty dope.",
-        "No dough, no go, sorry joe.",
-        "I'll be right with you after I figure out how to center a div in CSS.",
-        "The pizza gods demand rest. Are the hunger pangs interrupting your game?",
-        "Our pizza chef currently has the high score on the Road Kings pinball machine, you dare disturb him?",
-        "Today's special: disappointment. Pizza unavailable.",
-        "Our last pizza became a perpetual motion machine, left the atmosphere and is flying through the heavens.",
-        "Ran out of oregano and optimism. See you next time.",
-        "WAR AND PEACE, BY LEO TOLSTOY, BOOK ONE: 1805, CHAPTER I  “Well, Prince, so Genoa and Lucca are now just family estates of the Buonapartes. But I warn you, if you don’t tell me that this means war, if you still try to defend the infamies and horrors perpetrated by that Antichrist—I really believe he is Antichrist—I will have nothing more to do with you and you are no longer my friend, no longer my ‘faithful slave,’ as you call yourself! But how do you do? I see I have frightened you—sit down and tell me all the news.”
-
-It was in July, 1805, and the speaker was the well-known Anna Pávlovna Schérer, maid of honor and favorite of the Empress Márya Fëdorovna. With these words she greeted Prince Vasíli Kurágin, a man of high rank and importance, who was the first to arrive at her reception. Anna Pávlovna had had a cough for some days. She was, as she said, suffering from la grippe; grippe being then a new word in St. Petersburg, used only by the elite.
-
-All her invitations without exception, written in French, and delivered by a scarlet-liveried footman that morning, ran as follows:
-
-“If you have nothing better to do, Count (or Prince), and if the prospect of spending an evening with a poor invalid is not too terrible, I shall be very charmed to see you tonight between 7 and 10—Annette Schérer.”
-
-“Heavens! what a virulent attack!” replied the prince, not in the least disconcerted by this reception. He had just entered, wearing an embroidered court uniform, knee breeches, and shoes, and had stars on his breast and a serene expression on his flat face. He spoke in that refined French in which our grandfathers not only spoke but thought, and with the gentle, patronizing intonation natural to a man of importance who had grown old in society and at court. He went up to Anna Pávlovna, kissed her hand, presenting to her his bald, scented, and shining head, and complacently seated himself on the sofa.
-
-“First of all, dear friend, tell me how you are. Set your friend’s mind at rest,” said he without altering his tone, beneath the politeness and affected sympathy of which indifference and even irony could be discerned.
-
-“Can one be well while suffering morally? Can one be calm in times like these if one has any feeling?” said Anna Pávlovna. “You are staying the whole evening, I hope?”
-
-“And the fete at the English ambassador’s? Today is Wednesday. I must put in an appearance there,” said the prince. “My daughter is coming for me to take me there.”
-
-“I thought today’s fete had been canceled. I confess all these festivities and fireworks are becoming wearisome.”
-
-“If they had known that you wished it, the entertainment would have been put off,” said the prince, who, like a wound-up clock, by force of habit said things he did not even wish to be believed.
-
-“Don’t tease! Well, and what has been decided about Novosíltsev’s dispatch? You know everything.”
-
-“What can one say about it?” replied the prince in a cold, listless tone. “What has been decided? They have decided that Buonaparte has burnt his boats, and I believe that we are ready to burn ours.”
-
-Prince Vasíli always spoke languidly, like an actor repeating a stale part. Anna Pávlovna Schérer on the contrary, despite her forty years, overflowed with animation and impulsiveness. To be an enthusiast had become her social vocation and, sometimes even when she did not feel like it, she became enthusiastic in order not to disappoint the expectations of those who knew her. The subdued smile which, though it did not suit her faded features, always played round her lips expressed, as in a spoiled child, a continual consciousness of her charming defect, which she neither wished, nor could, nor considered it necessary, to correct.
-
-In the midst of a conversation on political matters Anna Pávlovna burst out:
-
-“Oh, don’t speak to me of Austria. Perhaps I don’t understand things, but Austria never has wished, and does not wish, for war. She is betraying us! Russia alone must save Europe. Our gracious sovereign recognizes his high vocation and will be true to it. That is the one thing I have faith in! Our good and wonderful sovereign has to perform the noblest role on earth, and he is so virtuous and noble that God will not forsake him. He will fulfill his vocation and crush the hydra of revolution, which has become more terrible than ever in the person of this murderer and villain! We alone must avenge the blood of the just one.... Whom, I ask you, can we rely on?... England with her commercial spirit will not and cannot understand the Emperor Alexander’s loftiness of soul. She has refused to evacuate Malta. She wanted to find, and still seeks, some secret motive in our actions. What answer did Novosíltsev get? None. The English have not understood and cannot understand the self-abnegation of our Emperor who wants nothing for himself, but only desires the good of mankind. And what have they promised? Nothing! And what little they have promised they will not perform! Prussia has always declared that Buonaparte is invincible, and that all Europe is powerless before him.... And I don’t believe a word that Hardenburg says, or Haugwitz either. This famous Prussian neutrality is just a trap. I have faith only in God and the lofty destiny of our adored monarch. He will save Europe!”
-
-She suddenly paused, smiling at her own impetuosity.
-
-“I think,” said the prince with a smile, “that if you had been sent instead of our dear Wintzingerode you would have captured the King of Prussia’s consent by assault. You are so eloquent. Will you give me a cup of tea?”
-
-“In a moment. À propos,” she added, becoming calm again, “I am expecting two very interesting men tonight, le Vicomte de Mortemart, who is connected with the Montmorencys through the Rohans, one of the best French families. He is one of the genuine émigrés, the good ones. And also the Abbé Morio. Do you know that profound thinker? He has been received by the Emperor. Had you heard?”
-
-“I shall be delighted to meet them,” said the prince. “But tell me,” he added with studied carelessness as if it had only just occurred to him, though the question he was about to ask was the chief motive of his visit, “is it true that the Dowager Empress wants Baron Funke to be appointed first secretary at Vienna? The baron by all accounts is a poor creature.”
-
-Prince Vasíli wished to obtain this post for his son, but others were trying through the Dowager Empress Márya Fëdorovna to secure it for the baron.
-
-Anna Pávlovna almost closed her eyes to indicate that neither she nor anyone else had a right to criticize what the Empress desired or was pleased with.
-
-“Baron Funke has been recommended to the Dowager Empress by her sister,” was all she said, in a dry and mournful tone.
-
-As she named the Empress, Anna Pávlovna’s face suddenly assumed an expression of profound and sincere devotion and respect mingled with sadness, and this occurred every time she mentioned her illustrious patroness. She added that Her Majesty had deigned to show Baron Funke beaucoup d’estime, and again her face clouded over with sadness.
-
-The prince was silent and looked indifferent. But, with the womanly and courtierlike quickness and tact habitual to her, Anna Pávlovna wished both to rebuke him (for daring to speak as he had done of a man recommended to the Empress) and at the same time to console him, so she said:
-
-“Now about your family. Do you know that since your daughter came out everyone has been enraptured by her? They say she is amazingly beautiful.”
-
-The prince bowed to signify his respect and gratitude.
-
-“I often think,” she continued after a short pause, drawing nearer to the prince and smiling amiably at him as if to show that political and social topics were ended and the time had come for intimate conversation—“I often think how unfairly sometimes the joys of life are distributed. Why has fate given you two such splendid children? I don’t speak of Anatole, your youngest. I don’t like him,” she added in a tone admitting of no rejoinder and raising her eyebrows. “Two such charming children. And really you appreciate them less than anyone, and so you don’t deserve to have them.”
-
-And she smiled her ecstatic smile.
-
-“I can’t help it,” said the prince. “Lavater would have said I lack the bump of paternity.”
-
-“Don’t joke; I mean to have a serious talk with you. Do you know I am dissatisfied with your younger son? Between ourselves” (and her face assumed its melancholy expression), “he was mentioned at Her Majesty’s and you were pitied....”
-
-The prince answered nothing, but she looked at him significantly, awaiting a reply. He frowned."
+        "Sorry, no pineapple today.",
+        "All toppings are currently missing.",
+        "Pizza gods demand rest."
       ]
       puts @pastel.bright_red(excuses.sample)
       exit
     end
 
-    def display_list_help_and_exit
-      display_banner
+    # -------------------------
+    # HELPERS
+    # -------------------------
+    def display_response(resp)
+      case resp[:result]
+      when 'success'
+        puts "#{@pastel.green.bold('SUCCESS:')} #{resp[:message]}"
+      when 'error'
+        color = resp[:error_type] == 'file_exists' ? :yellow : :red
+        puts "#{@pastel.send(color).bold('ERROR:')} #{resp[:message]}#{resp[:error_type] ? " (#{resp[:error_type]})" : ''}"
+      end
+    end
 
-      puts <<HERE
-  #{@pastel.green.bold 'list'} - List files on your Neocities site
+    def handle_version
+      return unless @argv[0] == 'version'
 
-  #{@pastel.dim 'Examples:'}
-
-  #{@pastel.green '$ neocities list /'}           List files in your root directory
-
-  #{@pastel.green '$ neocities list -a'}          Recursively display all files and directories
-
-  #{@pastel.green '$ neocities list -d /mydir'}   Show detailed information on /mydir
-
-HERE
+      puts Neocities::VERSION
       exit
     end
 
-    def display_delete_help_and_exit
-      display_banner
-
-      puts <<HERE
-  #{@pastel.green.bold 'delete'} - Delete files on your Neocities site
-
-  #{@pastel.dim 'Examples:'}
-
-  #{@pastel.green '$ neocities delete myfile.jpg'}               Delete myfile.jpg
-
-  #{@pastel.green '$ neocities delete myfile.jpg myfile2.jpg'}   Delete myfile.jpg and myfile2.jpg
-
-  #{@pastel.green '$ neocities delete mydir'}                    Deletes mydir and everything inside it (be careful!)
-
-HERE
-      exit
+    def help_request?
+      HELP_SUBCOMMANDS.include?(@subcmd) || @subargs.join('').match?(HELP_SUBCOMMANDS.join('|'))
     end
 
-    def display_upload_help_and_exit
-      display_banner
-
-      puts <<HERE
-  #{@pastel.green.bold 'upload'} - Upload individual files to your Neocities site
-
-  #{@pastel.dim 'Examples:'}
-
-  #{@pastel.green '$ neocities upload img.jpg img2.jpg'}    Upload images to the root of your site
-
-  #{@pastel.green '$ neocities upload -d images img.jpg'}   Upload img.jpg to the 'images' directory on your site
-
-HERE
-      exit
+    def display_help_for_subcommand(subcmd)
+      send("display_#{subcmd}_help") rescue display_help
     end
 
-    def display_pull_help_and_exit
-      display_banner
+    # -------------------------
+    # PUSH LOGIC HELPERS
+    # -------------------------
+    def parse_push_options
+      @use_gitignore = false
+      @excluded_files = []
+      @dry_run = false
+      @prune = false
+      @local_path = nil
 
-      puts <<HERE
-  #{@pastel.magenta.bold 'pull'} - Get the most recent version of files from your site, does not download if files haven't changed
-
-HERE
-      exit
+      while arg = @subargs.shift
+        case arg
+        when '--gitignore' then @use_gitignore = true
+        when '-e' then @excluded_files << @subargs.shift
+        when '--dry-run' then @dry_run = true
+        when '--prune' then @prune = true
+        else
+          if arg.start_with?('-')
+            puts @pastel.red.bold("Unknown option: #{arg.inspect}")
+            display_push_help
+          else
+            @local_path = arg
+          end
+        end
+      end
     end
 
-    def display_push_help_and_exit
-      display_banner
+    def files_to_upload(root_path)
+      ignore_patterns = load_ignore_patterns
+      files = []
 
-      puts <<HERE
-  #{@pastel.green.bold 'push'} - Recursively upload a local directory to your Neocities site
-
-  #{@pastel.dim 'Examples:'}
-
-  #{@pastel.green '$ neocities push .'}                                 Recursively upload current directory.
-
-  #{@pastel.green '$ neocities push -e node_modules -e secret.txt .'}   Exclude certain files from push
-
-  #{@pastel.green '$ neocities push --no-gitignore .'}                  Don't use .gitignore to exclude files
-
-  #{@pastel.green '$ neocities push --dry-run .'}                       Just show what would be uploaded
-
-  #{@pastel.green '$ neocities push --prune .'}                         Delete site files not in dir (be careful!)
-
-HERE
-      exit
-    end
-
-    def display_info_help_and_exit
-      display_banner
-
-      puts <<HERE
-  #{@pastel.green.bold 'info'} - Get site info
-
-  #{@pastel.dim 'Examples:'}
-
-  #{@pastel.green '$ neocities info fauux'}   Gets info for 'fauux' site
-
-HERE
-      exit
-    end
-
-    def display_logout_help_and_exit
-      display_banner
-
-      puts <<HERE
-  #{@pastel.green.bold 'logout'} - Remove the site api key from the config
-
-  #{@pastel.dim 'Examples:'}
-
-  #{@pastel.green '$ neocities logout -y'}
-
-HERE
-      exit
-    end
-
-    def display_banner
-      puts <<HERE
-
-  |\\---/|
-  | #{PENELOPE_EYES.sample}_#{PENELOPE_EYES.sample} |  #{@pastel.cyan.bold '     Neogities, a "neocities-ruby" fork by SyntaxError!'}
-   \\_#{PENELOPE_MOUTHS.sample}_/
-
-HERE
-    end
-
-    def display_help_and_exit
-      display_banner
-      puts <<HERE
-  #{@pastel.dim 'Subcommands:'}
-    push        Recursively upload a local directory to your site
-    upload      Upload individual files to your Neocities site
-    delete      Delete files from your Neocities site
-    list        List files from your Neocities site
-    info        Information and stats for your site
-    logout      Remove the site api key from the config
-    version     Unceremoniously display version and self destruct
-    pull        Get the most recent version of files from your site
-    pizza       Order a free pizza
-
-HERE
-      exit
-    end
-
-    def self.app_config_path(name)
-      platform = if RUBY_PLATFORM =~ /win32/
-        :win32
-      elsif RUBY_PLATFORM =~ /darwin/
-        :darwin
-      elsif RUBY_PLATFORM =~ /linux/
-        :linux
-      else
-        :unknown
+      require 'find'
+      Find.find(root_path) do |file|
+        next if ignored?(file, root_path, ignore_patterns)
+        files << Pathname.new(file) unless File.directory?(file)
       end
 
-      case platform
-      when :linux
-        if ENV['XDG_CONFIG_HOME']
-          return File.join(ENV['XDG_CONFIG_HOME'], name)
-        end
+      files
+    end
 
-        if ENV['HOME']
-          return File.join(ENV['HOME'], '.config', name)
+    def ignored?(file, root_path, patterns)
+      relative = Pathname.new(file).relative_path_from(root_path).to_s
+      patterns.any? { |pattern| relative == pattern || relative.start_with?("#{pattern}/") }
+    end
+
+    def load_ignore_patterns
+      patterns = []
+
+      [".neoignore", ".gitignore"].each do |f|
+        next unless File.exist?(f)
+        File.readlines(f).map(&:strip).reject(&:empty?).each { |line| patterns << line.chomp('/') }
+      end
+
+      patterns << @excluded_files if @excluded_files.any?
+      patterns.flatten
+    end
+
+    def upload_file(file, root_path)
+      relative_path = file.relative_path_from(root_path)
+      print @pastel.bold("Uploading #{file} ... ")
+      resp = @client.upload(file, relative_path, @dry_run)
+
+      case resp[:result]
+      when 'success' then puts @pastel.green.bold('SUCCESS')
+      when 'error'
+        if resp[:error_type] == 'file_exists'
+          puts @pastel.yellow.bold('EXISTS')
+        else
+          puts
+          display_response(resp)
         end
-      when :darwin
-        return File.join(ENV['HOME'], 'Library', 'Application Support', name)
+      end
+    end
+
+    def prune_remote
+      resp = @client.list
+      resp[:files].each do |file|
+        remote_file = Pathname.new(File.join(@local_path, file[:path]))
+        next if remote_file.exist?
+
+        print @pastel.bold("Deleting #{file[:path]} ... ")
+        resp = @client.delete_wrapper_with_dry_run(file[:path], @dry_run)
+        puts resp[:result] == 'success' ? @pastel.green.bold('SUCCESS') : display_response(resp)
+      end
+    end
+
+    # -------------------------
+    # CONFIG / LOGIN
+    # -------------------------
+    def load_api_key_or_login
+      return if @api_key
+
+      begin
+        data = JSON.parse(File.read(@app_config_path))
+        @api_key = data['API_KEY']&.strip
+        @sitename = data['SITENAME']
+      rescue Errno::ENOENT
+        login
+      end
+    end
+
+    def login
+      puts "Please login to get your API key:"
+      @sitename ||= @prompt.ask('Sitename:', default: ENV['NEOCITIES_SITENAME'])
+      password = @prompt.mask('Password:', default: ENV['NEOCITIES_PASSWORD'])
+
+      @client = Neocities::Client.new(sitename: @sitename, password: password)
+      resp = @client.key
+
+      if resp[:api_key]
+        FileUtils.mkdir_p(Pathname(@app_config_path).dirname)
+        File.write(@app_config_path, { API_KEY: resp[:api_key], SITENAME: @sitename }.to_json)
+        @api_key = resp[:api_key]
+        puts "API key stored at #{@app_config_path}."
       else
-        # Windows platform detection is weird, just look for the env variables
-        if ENV['LOCALAPPDATA']
-          return File.join(ENV['LOCALAPPDATA'], name)
-        end
+        display_response(resp)
+        exit
+      end
+    end
 
-        if ENV['USERPROFILE']
-          return File.join(ENV['USERPROFILE'], 'Local Settings', 'Application Data', name)
-        end
+    # -------------------------
+    # HELP / DISPLAY
+    # -------------------------
+    def display_help
+      banner
+      puts <<~HELP
+        Subcommands:
+          push      Recursively upload a local directory
+          upload    Upload individual files
+          delete    Delete files
+          list      List files
+          info      Show site info
+          logout    Remove API key
+          version   Show version
+          pull      Pull latest files
+          pizza     Order a free pizza
+      HELP
+      exit
+    end
 
-        # Should work for the BSDs
-        if ENV['HOME']
-          return File.join(ENV['HOME'], '.'+name)
-        end
+    def banner
+      puts <<~BANNER
+
+        |\\---/|
+        | #{PENELOPE_EYES.sample}_#{PENELOPE_EYES.sample} |  #{@pastel.cyan.bold 'Neogities CLI'}
+         \\_#{PENELOPE_MOUTHS.sample}_/
+
+      BANNER
+    end
+
+    def display_push_help
+      puts <<~HELP
+        Usage: push [options] PATH
+        Options:
+          --gitignore      Use .gitignore patterns
+          -e FILE          Exclude specific file
+          --dry-run        Show what would be uploaded without uploading
+          --prune          Delete remote files not present locally
+      HELP
+      exit
+    end
+
+    def display_upload_help
+      puts <<~HELP
+        Usage: upload [options] FILES...
+        Options:
+          -d DIR           Remote directory to upload into
+      HELP
+      exit
+    end
+
+    def display_delete_help
+      puts <<~HELP
+        Usage: delete FILES...
+        Deletes the specified remote files.
+      HELP
+      exit
+    end
+
+    def display_list_help
+      puts <<~HELP
+        Usage: list [PATH]
+        Options:
+          -d    Show detailed list with sizes and update dates
+          -a    List all files including hidden
+      HELP
+      exit
+    end
+
+    def display_logout_help
+      puts <<~HELP
+        Usage: logout -y
+        Removes stored API key.
+      HELP
+      exit
+    end
+
+    # -------------------------
+    # CONFIG PATH
+    # -------------------------
+    def self.app_config_path(name)
+      home = ENV['HOME'] || ENV['USERPROFILE']
+      xdg = ENV['XDG_CONFIG_HOME']
+      case RUBY_PLATFORM
+      when /win32/ then ENV['LOCALAPPDATA'] || File.join(home, 'Local Settings', 'Application Data', name)
+      when /darwin/ then File.join(home, 'Library', 'Application Support', name)
+      else xdg ? File.join(xdg, name) : File.join(home, '.config', name)
       end
     end
   end
