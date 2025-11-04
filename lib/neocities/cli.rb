@@ -183,99 +183,154 @@ module Neocities
       end
     end
 
-    def push
-      display_push_help_and_exit if @subargs.empty?
-      @no_gitignore = false
-      @excluded_files = []
-      @dry_run = false
-      @prune = false
-      loop do
-        case @subargs[0]
-        when '--no-gitignore' then @subargs.shift; @no_gitignore = true
-        when '-e' then @subargs.shift; @excluded_files.push(@subargs.shift)
-        when '--dry-run' then @subargs.shift; @dry_run = true
-        when '--prune' then @subargs.shift; @prune = true
-        when /^-/ then puts(@pastel.red.bold("Unknown option: #{@subargs[0].inspect}")); display_push_help_and_exit
-        else break
-        end
+def push
+  display_push_help_and_exit if @subargs.empty?
+  @use_gitignore = false
+  @excluded_files = []
+  @dry_run = false
+  @prune = false
+
+  # Lendo opções
+  loop do
+    case @subargs[0]
+    when '--gitignore' then @subargs.shift; @use_gitignore = true
+    when '-e' then @subargs.shift; @excluded_files.push(@subargs.shift)
+    when '--dry-run' then @subargs.shift; @dry_run = true
+    when '--prune' then @subargs.shift; @prune = true
+    when /^-/ then puts(@pastel.red.bold("Unknown option: #{@subargs[0].inspect}")); display_push_help_and_exit
+    else break
+    end
+  end
+
+  local_path = @subargs[0]
+  display_response(result: 'error', message: "no local path provided") && display_push_help_and_exit if local_path.nil?
+
+  root_path = Pathname(local_path)
+  unless root_path.exist?
+    display_response result: 'error', message: "path #{root_path} does not exist"
+    display_push_help_and_exit
+  end
+  unless root_path.directory?
+    display_response result: 'error', message: 'provided path is not a directory'
+    display_push_help_and_exit
+  end
+
+  puts @pastel.green.bold("Doing a dry run, not actually pushing anything") if @dry_run
+
+  # --- Prune ---
+  if @prune
+    pruned_dirs = []
+    resp = @client.list
+    resp[:files].each do |file|
+      path = Pathname(File.join(local_path, file[:path]))
+      pruned_dirs << path if !path.exist? && file[:is_directory]
+      next if path.exist? || pruned_dirs.include?(path.dirname)
+
+      print @pastel.bold("Deleting #{file[:path]} ... ")
+      resp = @client.delete_wrapper_with_dry_run file[:path], @dry_run
+      resp[:result] == 'success' ? print(@pastel.green.bold("SUCCESS") + "\n") : (print "\n"; display_response resp)
+    end
+  end
+
+  # --- Lista de arquivos ---
+  Dir.chdir(root_path) do
+    paths = Dir.glob(File.join('**', '*'), File::FNM_DOTMATCH)
+
+    # --- Ignorar arquivos ---
+    ignore_patterns = []
+
+    # .neoignore
+    if File.exist?('.neoignore')
+      File.readlines('.neoignore').each do |line|
+        line.strip!
+        next if line.empty?
+        ignore_patterns << (line.end_with?('/') ? "#{line}**/*" : line)
       end
+      puts "Not pushing .neoignore entries" unless ignore_patterns.empty?
+    end
 
-      if @subargs[0].nil?
-        display_response result: 'error', message: "no local path provided"
-        display_push_help_and_exit
+    # opcional .gitignore
+    if @use_gitignore && File.exist?('.gitignore')
+      File.readlines('.gitignore').each do |line|
+        line.strip!
+        next if line.empty?
+        ignore_patterns << (line.end_with?('/') ? "#{line}**/*" : line)
       end
+      puts "Also applying .gitignore entries"
+    end
 
-      root_path = Pathname @subargs[0]
+    # filtra paths
+    paths.select! do |p|
+      path_str = p.to_s
+      !ignore_patterns.any? { |pattern| File.fnmatch?(pattern, path_str) } &&
+        !@excluded_files.include?(path_str) &&
+        !@excluded_files.include?(Pathname.new(path_str).dirname.to_s)
+    end
 
-      if !root_path.exist?
-        display_response result: 'error', message: "path #{root_path} does not exist"
-        display_push_help_and_exit
+    paths.collect! { |p| Pathname p }
+
+    # --- Upload ---
+    paths.each do |path|
+      next if path.directory?
+      print @pastel.bold("Uploading #{path} ... ")
+      resp = @client.upload path, path, @dry_run
+
+      if resp[:result] == 'error' && resp[:error_type] == 'file_exists'
+        print @pastel.yellow.bold("EXISTS") + "\n"
+      elsif resp[:result] == 'success'
+        print @pastel.green.bold("SUCCESS") + "\n"
+      else
+        print "\n"
+        display_response resp
       end
+    end
+  end
+end
 
-      if !root_path.directory?
-        display_response result: 'error', message: 'provided path is not a directory'
-        display_push_help_and_exit
-      end
 
-      if @dry_run
-        puts @pastel.green.bold("Doing a dry run, not actually pushing anything")
-      end
-
-      if @prune
-        pruned_dirs = []
-        resp = @client.list
-        resp[:files].each do |file|
-          path = Pathname(File.join(@subargs[0], file[:path]))
-
-          pruned_dirs << path if !path.exist? && (file[:is_directory])
-
-          if !path.exist? && !pruned_dirs.include?(path.dirname)
-            print @pastel.bold("Deleting #{file[:path]} ... ")
-            resp = @client.delete_wrapper_with_dry_run file[:path], @dry_run
-
-            if resp[:result] == 'success'
-              print @pastel.green.bold("SUCCESS") + "\n"
-            else
-              print "\n"
-              display_response resp
-            end
-          end
-        end
-      end
-
+      # --- Lista e envia arquivos ---
       Dir.chdir(root_path) do
+        # Todos os arquivos recursivamente, incluindo hidden
         paths = Dir.glob(File.join('**', '*'), File::FNM_DOTMATCH)
 
-        if @no_gitignore == false
+        # Define arquivos de ignore
+        ignore_files = [".neoignore"]
+        ignore_files << ".gitignore" if @use_gitignore
+
+        ignore_patterns = []
+
+        # Lê padrões de ignore
+        ignore_files.each do |file|
           begin
-            ignores = File.readlines('.gitignore').collect! do |ignore|
-              ignore.strip!
-              File.directory?(ignore) ? "#{ignore}**" : ignore
+            lines = File.readlines(file).map(&:strip).reject(&:empty?)
+            lines.each do |line|
+              # Se for diretório, adiciona glob para todo conteúdo
+              ignore_patterns << (File.directory?(line) ? "#{line}**" : line)
             end
-            paths.select! do |path|
-              res = true
-              ignores.each do |ignore|
-                if File.fnmatch?(ignore.strip, path)
-                  res = false
-                  break
-                end
-              end
-            end
-            puts "Not pushing .gitignore entries (--no-gitignore to disable)"
           rescue Errno::ENOENT
+            # ignora se o arquivo não existir
           end
         end
 
-        paths.select! { |p| !@excluded_files.include?(p) }
+        # Filtra arquivos ignorados
+        paths.select! do |path|
+          !ignore_patterns.any? { |pattern| File.fnmatch?(pattern, path) }
+        end
 
-        paths.select! { |p| !@excluded_files.include?(Pathname.new(p).dirname.to_s) }
+        # Remove arquivos/diretórios explicitamente excluídos
+        paths.select! do |p|
+          !@excluded_files.include?(p) && !@excluded_files.include?(Pathname.new(p).dirname.to_s)
+        end
 
-        paths.collect! { |path| Pathname path }
+        # Converte para Pathname
+        paths.collect! { |path| Pathname.new(path) }
 
+        # Itera sobre arquivos e envia
         paths.each do |path|
           next if path.directory?
+
           print @pastel.bold("Uploading #{path} ... ")
-          resp = @client.upload path, path, @dry_run
+          resp = @client.upload(path, path.relative_path_from(root_path), @dry_run)
 
           if resp[:result] == 'error' && resp[:error_type] == 'file_exists'
             print @pastel.yellow.bold("EXISTS") + "\n"
@@ -286,6 +341,106 @@ module Neocities
             display_response resp
           end
         end
+      end
+
+
+      Dir.chdir(root_path) do
+        paths = Dir.glob(File.join('**', '*'), File::FNM_DOTMATCH)
+
+        # Define os arquivos de ignore que serão usados
+        ignore_files = [".neoignore"]
+        ignore_files << ".gitignore" if @use_gitignore
+
+        ignore_patterns = []
+
+        ignore_files.each do |file|
+          begin
+            lines = File.readlines(file).map(&:strip).reject(&:empty?)
+            lines.each do |line|
+              ignore_patterns << (File.directory?(line) ? "#{line}**" : line)
+            end
+          rescue Errno::ENOENT
+            # ignora se o arquivo não existir
+          end
+        end
+
+        # Lista todos os arquivos recursivamente
+        paths = Dir.glob(File.join(root_path, "**", "*"), File::FNM_DOTMATCH)
+
+        # Remove arquivos ignorados
+        paths.select! do |path|
+          !ignore_patterns.any? { |pattern| File.fnmatch?(pattern, path) }
+        end
+
+        # Remove arquivos explicitamente excluídos via -e
+        paths.select! { |p| !@excluded_files.include?(p) && !@excluded_files.include?(Pathname.new(p).dirname.to_s) }
+
+        # Converte tudo para Pathname
+        paths.collect! { |path| Pathname.new(path) }
+
+        # Agora começa a iterar e subir os arquivos
+        paths.each do |path|
+          next if path.directory?
+          print @pastel.bold("Uploading #{path} ... ")
+          resp = @client.upload path, path.relative_path_from(root_path), @dry_run
+
+          if resp[:result] == 'error' && resp[:error_type] == 'file_exists'
+            print @pastel.yellow.bold("EXISTS") + "\n"
+          elsif resp[:result] == 'success'
+            print @pastel.green.bold("SUCCESS") + "\n"
+          else
+            print "\n"
+            display_response resp
+          end
+        end
+        # Define os arquivos de ignore que serão usados
+        ignore_files = [".neoignore"]
+        ignore_files << ".gitignore" if @use_gitignore
+
+        ignore_patterns = []
+
+        ignore_files.each do |file|
+          begin
+            lines = File.readlines(file).map(&:strip).reject(&:empty?)
+            lines.each do |line|
+              ignore_patterns << (File.directory?(line) ? "#{line}**" : line)
+            end
+          rescue Errno::ENOENT
+            # ignora se o arquivo não existir
+          end
+        end
+
+        # Lista todos os arquivos recursivamente
+        paths = Dir.glob(File.join(root_path, "**", "*"), File::FNM_DOTMATCH)
+
+        # Remove arquivos ignorados
+        paths.select! do |path|
+          !ignore_patterns.any? { |pattern| File.fnmatch?(pattern, path) }
+        end
+
+        # Remove arquivos explicitamente excluídos via -e
+        paths.select! { |p| !@excluded_files.include?(p) }
+        paths.select! { |p| !@excluded_files.include?(Pathname.new(p).dirname.to_s) }
+
+        # Converte tudo para Pathname
+        paths.collect! { |path| Pathname.new(path) }
+
+        # Agora começa a iterar e subir os arquivos
+        paths.each do |path|
+          next if path.directory?
+          print @pastel.bold("Uploading #{path} ... ")
+          resp = @client.upload path, path.relative_path_from(root_path), @dry_run
+
+          if resp[:result] == 'error' && resp[:error_type] == 'file_exists'
+            print @pastel.yellow.bold("EXISTS") + "\n"
+          elsif resp[:result] == 'success'
+            print @pastel.green.bold("SUCCESS") + "\n"
+          else
+            print "\n"
+            display_response resp
+          end
+        end
+
       end
     end
 
