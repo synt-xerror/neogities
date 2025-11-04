@@ -29,7 +29,7 @@ This project is actively being developed and will be updated soon.
 Run this command to install Neogities quickly:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/synt-xerror/neogities/main/install/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/synt-xerror/neogities/master/install/install.sh | bash
 ```
 
 Or, if you want to inspect the script first:
