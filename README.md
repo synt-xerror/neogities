@@ -78,3 +78,6 @@ bundle -v
 **Important Notes**
 
 Run the script as a normal user, not root. Using sudo can cause `$HOME` conflicts and permission issues.
+</details>
+
+### Windows version under development !!
