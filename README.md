@@ -10,11 +10,11 @@ This project is actively being developed and will be updated soon.
 
 ---
 
-## Future Features
-- Support for `.neoignore` to exclude files from deployment (can also use `.gitignore` if desired)
-- Automatic detection and removal of deleted files from remote
-- Ability to push specific files without uploading the entire directory
-- And more… suggestions and contributions are welcome!
+## Features
+- [x] Support for `.neoignore` to exclude files from deployment [See how it works](DOCS.md)
+- [ ] Automatic detection and removal of deleted files from remote
+- [ ] Ability to push specific files without uploading the entire directory
+- [ ] And more… suggestions and contributions are welcome!
 
 ---
 
