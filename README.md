@@ -14,7 +14,8 @@ This project is actively being developed and will be updated soon.
 - [x] Support for `.neoignore` to exclude files from deployment [See how it works](DOCS.md)
 - [ ] Automatic detection and removal of deleted files from remote
 - [ ] Ability to push specific files without uploading the entire directory
-- [ ] And more… suggestions and contributions are welcome!
+- [ ] Snapshots and commits for version control (helps with faster deployment) 
+- And more… suggestions and contributions are welcome!
 
 ---
 
