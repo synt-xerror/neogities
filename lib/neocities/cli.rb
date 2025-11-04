@@ -239,15 +239,35 @@ def push
     # --- Ignorar arquivos ---
     ignore_patterns = []
 
-    # .neoignore
-    if File.exist?('.neoignore')
-      File.readlines('.neoignore').each do |line|
-        line.strip!
-        next if line.empty?
-        ignore_patterns << (line.end_with?('/') ? "#{line}**/*" : line)
-      end
-      puts "Not pushing .neoignore entries" unless ignore_patterns.empty?
-    end
+    ignore_patterns = []
+
+if File.exist?('.neoignore')
+  File.readlines('.neoignore').each do |line|
+    line.strip!
+    next if line.empty?
+    ignore_patterns << "#{line}/**/*"
+    ignore_patterns << line
+  end
+  puts "Not pushing .neoignore entries" unless ignore_patterns.empty?
+end
+
+# Função que verifica se um arquivo deve ser ignorado
+def ignored?(file, ignore_patterns)
+  # Retorna true se algum padrão do ignore_patterns corresponder ao arquivo
+  ignore_patterns.any? do |pattern|
+    # File.fnmatch compara o arquivo com o padrão, incluindo arquivos ocultos e caminhos
+    File.fnmatch?(pattern, file, File::FNM_PATHNAME | File::FNM_DOTMATCH)
+  end
+end
+
+# Loop que percorre todos os arquivos a partir do root_path
+Dir.glob("#{root_path}/**/*") do |file|
+  # Pula o arquivo se ele deve ser ignorado
+  next if ignored?(file, ignore_patterns)
+  # Aqui seria o upload do arquivo
+  @client.upload(file)
+end
+
 
     # opcional .gitignore
     if @use_gitignore && File.exist?('.gitignore')
