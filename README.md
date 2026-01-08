@@ -1,5 +1,6 @@
 # Neogities — a "neocities-ruby" fork by SyntaxError!
 Original repo: [neocities-ruby](https://github.com/neocities/neocities-ruby)
+
 status: [rotating](https://github.com/synt-xerror/synt-xerror)
 
 ## What's the big deal?
