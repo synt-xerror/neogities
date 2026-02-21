@@ -7,8 +7,18 @@
 #include <jansson.h>
 #include <string.h>
 
+#include <pwd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+
+#include <termios.h>
+
+#include <readline/readline.h>
+#include <readline/history.h>
+
 // -------------------------
-// HTTP responde buffer
+// HTTP response buffer
 // -------------------------
 struct response {
     	char *data;
@@ -104,35 +114,11 @@ static int perform_request(
 }
 
 // -------------------------
-// JSON parsers
-// -------------------------
-void neocities_free_info(
-	neocities_info_t *info
-)
-{
-    	if (!info) return;
-    	free(info->sitename);
-    	free(info->created_at);
-    	free(info->last_updated);
-    	free(info->domain);
-    	for (size_t i=0; i<info->tag_count; i++) free(info->tags[i]);
-    	free(info->tags);
-}
-
-void neocities_free_filelist(
-	neocities_filelist_t *list
-)
-{
-    	if (!list) return;
-    	for (size_t i=0; i<list->count; i++) free(list->paths[i]);
-    	free(list->paths);
-}
-
-// -------------------------
 // info — GET /api/info
 // -------------------------
 int neocities_info(
-	const char *sitename, neocities_info_t *out
+	const char *sitename,
+	char** out
 )
 {
     	char url[512];
@@ -145,49 +131,9 @@ int neocities_info(
     	int ret = perform_request(url, NULL, NULL, &resp, NULL);
     	if (ret) return ret;
 
-    	json_error_t error;
-    	json_t *root = json_loads(resp.data, 0, &error);
-    	free(resp.data);
-    	if (!root) return 3;
-
-    	const char *result = json_string_value(json_object_get(root,"result"));
-    	if (!result || strcmp(result,"success")!=0) { json_decref(root); return 4; }
-
-	json_t *info = json_object_get(root,"info");
-	if (!json_is_object(info)) {
-	    json_decref(root);
-	    return 4;
-	}
-		
-	json_t *j_sitename = json_object_get(info,"sitename");
-	json_t *j_created  = json_object_get(info,"created_at");
-	json_t *j_updated  = json_object_get(info,"last_updated");
-	json_t *j_domain   = json_object_get(info,"domain");
-	json_t *j_hits     = json_object_get(info,"hits");
-	
-	out->sitename     = json_is_string(j_sitename) ? strdup(json_string_value(j_sitename)) : NULL;
-	out->created_at   = json_is_string(j_created)  ? strdup(json_string_value(j_created))  : NULL;
-	out->last_updated = json_is_string(j_updated)  ? strdup(json_string_value(j_updated))  : NULL;
-	out->domain       = json_is_string(j_domain)   ? strdup(json_string_value(j_domain))   : NULL;
-	out->hits         = json_is_integer(j_hits)    ? json_integer_value(j_hits) : 0;
-	
-    	json_t *tags = json_object_get(info,"tags");
-	if (!json_is_array(tags)) {
-	    out->tags = NULL;
-	    out->tag_count = 0;
-	} else {
-	    size_t tc = json_array_size(tags);
-	    out->tags = malloc(sizeof(char*) * tc);
-	    out->tag_count = tc;
-	
-	    for (size_t i=0; i<tc; i++) {
-	        json_t *tag = json_array_get(tags,i);
-	        out->tags[i] = json_is_string(tag) ? strdup(json_string_value(tag)) : NULL;
-	    }
-	}
-
-    	json_decref(root);
-    	return 0;
+	*out = resp.data;
+    	
+	return 0;
 }
 
 // -------------------------
@@ -195,7 +141,8 @@ int neocities_info(
 // -------------------------
 int neocities_list(
 	const char *api_key,
-	const char *path, neocities_filelist_t *out
+	const char *path,
+	char **out
 )
 {
 	char url[512];
@@ -206,23 +153,8 @@ int neocities_list(
     	int ret = perform_request(url, api_key, NULL, &resp, NULL);
 	if (ret) return ret;
 
-    	json_error_t error;
-    	json_t *root = json_loads(resp.data, 0, &error);
-    	free(resp.data);
-    	if (!root) return 3;
-
-    	json_t *arr = json_object_get(root, "files");
-    	if (!arr) { json_decref(root); return 4; }
-
-    	size_t count = json_array_size(arr);
-    	out->paths = malloc(sizeof(char*) * count);
-    	out->count = count;
-    	for (size_t i=0; i<count; i++) {
-    	    json_t *f = json_array_get(arr, i);
-    	    out->paths[i] = strdup(json_string_value(json_object_get(f,"path")));
-    	}
-    	json_decref(root);
-    	return 0;
+    	*out = resp.data;	
+	return 0;
 }
 
 // -------------------------
@@ -317,19 +249,168 @@ int neocities_upload(
     	return 0;
 }
 
+char* home()
+{
+	struct passwd *u;
+	u = getpwuid(getuid());
+
+	if (!u) {
+		perror("invalid return of getpwuid() function.\n");
+		return NULL;
+	}
+
+	return u->pw_dir;
+}
+
+// DIR_NAME deve ser o nome do diretório, não o caminho (ex: task)
+// Se HOME = NULL, a função assume que a pasta que quer está fora da pasta /home/usuário
+
+// Importante: essa função retorna um char*. Para abrir o diretório retornado, você deve usar
+// a função opendir() com o valor retornado de get_dir()
+char* get_dir(const char* HOME, const char* DIR_NAME) {
+	if (DIR_NAME[0] == '~') {
+		perror("get_dir doesn't expand '~'");
+		return NULL;
+	}
+	if (DIR_NAME[0] == '/') {
+		perror("DIR_NAME can't begin with '/'");
+		return NULL;
+	}
+
+	const char *prefix = HOME ? HOME : "";
+
+	int size = strlen(prefix) + 1 + strlen(DIR_NAME) + 1;
+	char *DIR_FINAL = malloc(size);
+	if (!DIR_FINAL) {
+		perror("malloc failed");
+		return NULL;
+	}
+
+	sprintf(DIR_FINAL, "%s/%s", prefix, DIR_NAME);
+
+	DIR *dir = opendir(DIR_FINAL);
+	if (!dir) {
+		if (mkdir(DIR_FINAL, 0755) != 0) {
+			fprintf(stderr, "'%s' cannot be created\n", DIR_FINAL);
+			free(DIR_FINAL);
+			return NULL;
+		}
+	} else {
+		closedir(dir);
+	}
+
+	return DIR_FINAL;
+}
+
+char* get_file(const char* ROOT, const char* FILE_NAME) {
+	char* FINAL_FILE;
+
+	FINAL_FILE = malloc(strlen(ROOT) + strlen(FILE_NAME) + 1);
+	sprintf(FINAL_FILE, "%s/%s", ROOT, FILE_NAME);
+
+	return FINAL_FILE;
+}
+
+struct termios orig_termios;
+
+void disable_raw_mode() { tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios); }
+void enable_raw_mode() {
+    	tcgetattr(STDIN_FILENO, &orig_termios);
+    	atexit(disable_raw_mode);
+    	struct termios raw = orig_termios;
+    	raw.c_lflag &= ~(ECHO | ICANON);
+    	raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 1;
+    	tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
+
+int read_key() {
+	char c; int n = read(STDIN_FILENO, &c, 1);
+	if (n == 1) {
+		if (c == '\033') {
+			char seq[2];
+			if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\033';
+			if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\033';
+			if (seq[0] == '[') {
+				switch(seq[1]) {
+					case 'A': return 1000; // cima
+					case 'B': return 1001; // baixo
+				}
+			}
+			return 0;
+		} 
+		return c;
+		}
+	return 0;
+}
+
+int menu(char *titles[], int n_titles, char *options[], int n_options, char *footer, int circular) {
+	int selected = 0;
+	enable_raw_mode();
+	
+	int total_lines = n_titles + n_options + (footer ? 1 : 0);
+	
+	while (1) {
+		// só imprime normalmente, abaixo do que já está
+		for (int i = 0; i < n_titles; i++) printf("%s\n", titles[i]);
+		for (int i = 0; i < n_options; i++) {
+			if (i == selected) printf("> %s\n", options[i]);
+			else printf("  %s\n", options[i]);
+		} 
+		if (footer) printf("%s\n", footer);
+			
+		int key = read_key();
+		if (key == 1000) { selected--; if (circular && selected < 0) selected = n_options - 1; if (!circular && selected < 0) selected = 0; }
+		else if (key == 1001) { selected++; if (circular && selected >= n_options) selected = 0; if (!circular && selected >= n_options) selected = n_options - 1; }
+		else if (key == '\n') break;
+		else if (key == 27) { selected = -1; break; }
+			
+		// depois de desenhar, sobe o cursor e apaga menu antigo
+		for (int i = 0; i < total_lines; i++) {
+			printf("\033[1A\033[2K"); // sobe 1 linha e limpa
+		} 
+	} 
+	
+	// move cursor pro topo do menu antigo
+	printf("\033[%dA", total_lines); 
+		
+	// limpa cada linha
+	for (int i = 0; i < total_lines; i++) {
+		printf("\033[2K");         // limpa a linha
+		if (i != total_lines-1) printf("\033[1B"); // desce linha
+	} 
+		
+	// volta cursor pro topo do menu
+	printf("\033[%dA", total_lines-1); 
+		
+	disable_raw_mode();
+	return selected;
+}
+
+const char* DATA_DIR = ".local/share/neogities";
+const char* CONFIG_DIR = ".config/neogities";
+
+const char* CONFIG_FILE = "neogities.conf";
+const char* ACCESS_FILE = "credentials";
+
 int main() {
 	static const char* version = "v0.1.0";
-	
+
+	const char* DEF_DATA_DIR = get_dir(home(), DATA_DIR);
+	const char* DEF_CONFIG_DIR = get_dir(home(), DATA_DIR);
+
+	const char* DEF_CONFIG_FILE = get_file(DEF_CONFIG_DIR, CONFIG_FILE);
+	const char* DEF_ACCESS_FILE = get_file(DEF_DATA_DIR, ACCESS_FILE);
+
 	srand(time(NULL) ^ getpid());
 
-	int n = rand() % 2;
-	int y = rand() % 2;
+	int a = rand() % 2;
+	int b = rand() % 2;
 
 	static const char* eyes[] = { "-_o", "o_o" };
 	static const char* mouths[] = { "-", "~" };
 	
-	const char* eye = eyes[n];
-	const char* mouth = mouths[y];
+	const char* eye = eyes[a];
+	const char* mouth = mouths[b];
 	
 	static const char *logo =
 	"|\\---/|---------------o\n"
@@ -337,8 +418,24 @@ int main() {
 	" \\_%s_/    %s    /   o\n"
 	"                   o\n";
 
+	printf("Hello! You're not logged in.\n\n");
 	printf(logo, eye, mouth, version);
 
-	return 0;
-}
+	/* char *titles[] = {"Meu Menu"};
+	char *options[] = {"Opção 1", "Opção 2", "Opção 3"};
+	char *footer = "Use setas ↑↓ e Enter para selecionar. ESC para sair.";
+	int choice = menu(titles, 1, options, 3, footer, 1);
 
+	printf("Selecionou: %d\n", choice); */
+
+	/* char *input = readline("Nome: ");  // mostra prompt e permite editar
+    	if (input != NULL) {
+    	    printf("Você digitou: %s\n", input);
+    	}
+
+	free(input); */
+	free((char*)DEF_DATA_DIR);
+	free((char*)DEF_CONFIG_DIR);
+	free((char*)DEF_CONFIG_FILE);
+	free((char*)DEF_ACCESS_FILE);
+} 
