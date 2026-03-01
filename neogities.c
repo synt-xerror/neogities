@@ -17,6 +17,8 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 
+#define MAX_LINE 256
+
 // -------------------------
 // HTTP response buffer
 // -------------------------
@@ -249,6 +251,42 @@ int neocities_upload(
     	return 0;
 }
 
+// -------------------------
+// key — GET /api/key
+// -------------------------
+int neocities_apikey(const char *user, const char *pass, char **out) {
+    struct response resp = {0};
+
+    char userpass[256];
+    snprintf(userpass, sizeof(userpass), "%s:%s", user, pass);
+
+    CURL *curl = curl_easy_init();
+    if (!curl) return 1;
+
+    resp.data = malloc(1);
+    resp.len = 0;
+    resp.data[0] = '\0';
+
+    curl_easy_setopt(curl, CURLOPT_URL, "https://neocities.org/api/key");
+    curl_easy_setopt(curl, CURLOPT_USERPWD, userpass); // aqui é equivalente ao -u do curl
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || http_code >= 400) {
+        free(resp.data);
+        return 2;
+    }
+
+    *out = resp.data; // resposta da API
+    return 0;
+}
+
 char* home()
 {
 	struct passwd *u;
@@ -302,13 +340,18 @@ char* get_dir(const char* HOME, const char* DIR_NAME) {
 	return DIR_FINAL;
 }
 
+
 char* get_file(const char* ROOT, const char* FILE_NAME) {
-	char* FINAL_FILE;
+    char* FINAL_FILE = malloc(strlen(ROOT) + strlen(FILE_NAME) + 2); // +2 para '/' e '\0'
+    if (!FINAL_FILE) return NULL;
 
-	FINAL_FILE = malloc(strlen(ROOT) + strlen(FILE_NAME) + 1);
-	sprintf(FINAL_FILE, "%s/%s", ROOT, FILE_NAME);
+    sprintf(FINAL_FILE, "%s/%s", ROOT, FILE_NAME);
 
-	return FINAL_FILE;
+    // Tenta abrir o arquivo em modo append (cria se não existir)
+    FILE* f = fopen(FINAL_FILE, "a");
+    if (f) fclose(f);  // Fecha imediatamente
+
+    return FINAL_FILE;
 }
 
 struct termios orig_termios;
@@ -392,15 +435,12 @@ const char* CONFIG_DIR = ".config/neogities";
 const char* CONFIG_FILE = "neogities.conf";
 const char* ACCESS_FILE = "credentials";
 
-int main() {
+
+//char* DEF_DATA_DIR = get_dir(home(), DATA_DIR);
+//char* DEF_ACCESS_FILE = get_dir(DEF_DATA_DIR, ACCESS_FILE);	
+
+void title() {
 	static const char* version = "v0.1.0";
-
-	const char* DEF_DATA_DIR = get_dir(home(), DATA_DIR);
-	const char* DEF_CONFIG_DIR = get_dir(home(), DATA_DIR);
-
-	const char* DEF_CONFIG_FILE = get_file(DEF_CONFIG_DIR, CONFIG_FILE);
-	const char* DEF_ACCESS_FILE = get_file(DEF_DATA_DIR, ACCESS_FILE);
-
 	srand(time(NULL) ^ getpid());
 
 	int a = rand() % 2;
@@ -412,14 +452,151 @@ int main() {
 	const char* eye = eyes[a];
 	const char* mouth = mouths[b];
 	
-	static const char *logo =
+	static const char* logo =
 	"|\\---/|---------------o\n"
 	"| %s |   Neogities  / \\\n"
 	" \\_%s_/    %s    /   o\n"
 	"                   o\n";
-
-	printf("Hello! You're not logged in.\n\n");
+	
 	printf(logo, eye, mouth, version);
+}
+
+char* get_conf(const char* conf) {
+	char* DEF_CONFIG_DIR = get_dir(home(), CONFIG_DIR);
+	char* DEF_CONFIG_FILE = get_file(DEF_CONFIG_DIR, CONFIG_FILE);
+	
+	if (!conf) {
+		printf("get_conf: No option provided.");
+		return "err";
+	}
+	
+	FILE *fp = fopen(DEF_CONFIG_FILE, "r");
+	if (!fp) {
+		printf("Error when opening config file on: %s", DEF_CONFIG_FILE);
+		return "err";
+	}
+
+	char line[MAX_LINE];
+	char lastLine[MAX_LINE] = "";
+
+	// Ler linha por linha e guardar a última que contém a conf
+	while (fgets(line, sizeof(line), fp)) {
+		if (strstr(line, conf)) {
+		    strcpy(lastLine, line);
+		}
+	}
+	fclose(fp);
+	free((char*)DEF_CONFIG_DIR);
+	free((char*)DEF_CONFIG_FILE);
+
+	if (strlen(lastLine) == 0) {
+		return "err";
+	}
+
+	// Tokenizar a linha
+	char *token1 = NULL, *token2 = NULL;
+	char *rest = lastLine;
+
+	token1 = strtok_r(rest, " \t\n", &rest);
+	token2 = strtok_r(rest, " \t\n", &rest);
+
+
+
+	if (token1 && token2) {
+		char *result = malloc(strlen(token2)+1);
+    		strcpy(result, token2);
+    		return result;
+	} else {
+		return "err";
+	}
+}
+
+void login() {	
+	//free((char*)DEF_ACCESS_FILE);
+}
+
+// TODO
+// fix segfault at menu
+// support to many accounts, credential files for single one with username and api key togheter
+// loggedas only to define with which one the user is logged in
+// detect when a account is logged and suggest the menu to choose which one to log
+
+int main(int argc, char* argv[]) {
+	static const char* commands =
+	"    login    Login to your Neocities account\n";
+
+	const char* loggedas = get_conf("loggedas");
+	if (strcmp(loggedas, "err") != 0) {
+		printf("Hello, %s.\n\n", loggedas);
+		free((char*)loggedas);  // liberar memória alocada
+	} else { 
+		printf("Hello! You're not logged in.\n\n");
+	}
+	title();	
+	
+	if (!argv){
+		printf("Core commands:\n");
+		printf("%s", commands);
+	} else if (strcmp(argv[1], "login") == 0) {
+		printf("\nLOGIN:\n");
+		
+		char *user = readline("Username: "); 
+		char *password = readline("Password: ");
+		
+		char* out = NULL;
+		json_error_t error;
+		
+		if (neocities_apikey(user, password, &out) == 0) {
+			json_t *root = json_loads(out, 0, &error);
+			json_t *api_key = json_object_get(root, "api_key");	
+			const char* str = json_string_value(api_key);	
+			
+			printf("Please wait...");
+			if (str) {
+				const char* DEF_CONFIG_DIR = get_file(home(), CONFIG_DIR);
+				const char* DEF_CONFIG_FILE = get_file(DEF_CONFIG_DIR, CONFIG_FILE);
+				const char* DEF_DATA_DIR = get_file(home(), DATA_DIR);
+				const char* DEF_ACCESS_FILE = get_file(DEF_DATA_DIR, ACCESS_FILE);
+				
+				FILE* access_f = fopen(DEF_ACCESS_FILE, "w");
+				if (!access_f) {
+				    return 1;
+				}
+				
+				fprintf(access_f, "%s", str);
+				fclose(access_f);
+				
+				char loggedas[64];
+				snprintf(loggedas, sizeof(loggedas), "loggedas %s", user);
+				
+				FILE* config_f = fopen(DEF_CONFIG_FILE, "r+");
+				if (!config_f) {
+				    return 1;
+				}
+				
+				fseek(config_f, 0, SEEK_SET);
+				
+				fwrite(loggedas, strlen(loggedas), 1, config_f);
+				
+				char* user_f = get_conf("loggedas");
+				
+				fclose(config_f);
+
+				free((char*)DEF_CONFIG_DIR);
+				free((char*)DEF_CONFIG_FILE);
+				
+				free((char*)DEF_DATA_DIR);
+				free((char*)DEF_ACCESS_FILE);
+
+				printf("Success! You have successfully logged as %s", user);
+			} else {
+				printf("Could not get API key, please check username and password and your internet connection.");
+			}
+		}
+
+		free(user);
+		free(password);
+	}	
 
 	/* char *titles[] = {"Meu Menu"};
 	char *options[] = {"Opção 1", "Opção 2", "Opção 3"};
@@ -428,14 +605,4 @@ int main() {
 
 	printf("Selecionou: %d\n", choice); */
 
-	/* char *input = readline("Nome: ");  // mostra prompt e permite editar
-    	if (input != NULL) {
-    	    printf("Você digitou: %s\n", input);
-    	}
-
-	free(input); */
-	free((char*)DEF_DATA_DIR);
-	free((char*)DEF_CONFIG_DIR);
-	free((char*)DEF_CONFIG_FILE);
-	free((char*)DEF_ACCESS_FILE);
 } 
